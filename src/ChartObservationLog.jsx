@@ -91,10 +91,11 @@ const Label = ({children, color}) => (
     letterSpacing:"0.08em",marginBottom:3}}>{children}</div>
 );
 
-const Inp = ({value, onChange, placeholder, width="100%", mono=false}) => (
-  <input value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+const Inp = ({value, onChange, placeholder, width="100%", mono=false, type="text"}) => (
+  <input value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} type={type}
     style={{background:C.surface,border:`1px solid ${C.border2}`,borderRadius:4,
       color:C.text,fontSize:12,padding:"4px 7px",width,outline:"none",boxSizing:"border-box",
+      colorScheme:"dark",
       fontFamily:mono?"'JetBrains Mono','Fira Code',monospace":"inherit"}}/>
 );
 
@@ -230,7 +231,7 @@ function TradeRow({ trade, index, onChange, onDelete, isOnly }) {
 
           {/* Row 1: Time, Direction, Quality, Outcome */}
           <div style={{display:"grid",gridTemplateColumns:"100px 1fr 1fr 1fr",gap:8}}>
-            <div><Label>Time (CT)</Label><Inp value={trade.time} onChange={v=>upd("time",v)} placeholder="09:45" mono/></div>
+            <div><Label>Time (CT)</Label><Inp value={trade.time} onChange={v=>upd("time",v)} type="time" mono/></div>
             <div>
               <Label>Direction</Label>
               <div style={{display:"flex",gap:4}}>
@@ -401,7 +402,7 @@ function DayCard({ day, index, onChange, onDelete }) {
           <div>
             <SecHead color={C.purple}>Session Context</SecHead>
             <div style={{display:"grid",gridTemplateColumns:"140px 140px 1fr 1fr 1fr",gap:10,marginBottom:10}}>
-              <div><Label>Date</Label><Inp value={day.date} onChange={v=>upd("date",v)} placeholder="2024-07-01" mono/></div>
+              <div><Label>Date</Label><Inp value={day.date} onChange={v=>upd("date",v)} type="date" mono/></div>
               <div><Label>Session Type</Label><Sel value={day.sessionType} onChange={v=>upd("sessionType",v)} options={SESSION_TYPES} placeholder="Classify…"/></div>
               <div><Label>Open Type</Label><Sel value={day.openType} onChange={v=>upd("openType",v)} options={OPEN_TYPES} placeholder="Open…"/></div>
               <div><Label>ATR State</Label><Sel value={day.atrState} onChange={v=>upd("atrState",v)} options={ATR_STATES} placeholder="ATR…"/></div>

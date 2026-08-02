@@ -18,22 +18,29 @@ export class BackendStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
-    const makeFn = (id: string, entry: string) =>
+    const pnlTable = new dynamodb.Table(this, "PnlEntriesTable", {
+      tableName: "PnlEntries",
+      partitionKey: { name: "date", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const makeFn = (id: string, lambdaDir: string, entry: string, tableName: string) =>
       new lambdaNode.NodejsFunction(this, id, {
-        entry: path.join(__dirname, "..", "lambda", entry),
+        entry: path.join(__dirname, "..", "lambda", lambdaDir, entry),
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_22_X,
         memorySize: 256,
         timeout: Duration.seconds(10),
-        environment: { TABLE_NAME: table.tableName },
+        environment: { TABLE_NAME: tableName },
         bundling: { minify: true },
       });
 
-    const createFn = makeFn("CreateLogFn", "create.ts");
-    const getFn = makeFn("GetLogFn", "get.ts");
-    const updateFn = makeFn("UpdateLogFn", "update.ts");
-    const deleteFn = makeFn("DeleteLogFn", "delete.ts");
-    const listFn = makeFn("ListLogsFn", "list.ts");
+    const createFn = makeFn("CreateLogFn", ".", "create.ts", table.tableName);
+    const getFn = makeFn("GetLogFn", ".", "get.ts", table.tableName);
+    const updateFn = makeFn("UpdateLogFn", ".", "update.ts", table.tableName);
+    const deleteFn = makeFn("DeleteLogFn", ".", "delete.ts", table.tableName);
+    const listFn = makeFn("ListLogsFn", ".", "list.ts", table.tableName);
 
     // Least-privilege: each function only gets the single DynamoDB action its handler uses.
     table.grant(createFn, "dynamodb:PutItem");
@@ -41,6 +48,18 @@ export class BackendStack extends Stack {
     table.grant(updateFn, "dynamodb:PutItem");
     table.grant(deleteFn, "dynamodb:DeleteItem");
     table.grant(listFn, "dynamodb:Scan");
+
+    const createPnlFn = makeFn("CreatePnlFn", "pnl", "create.ts", pnlTable.tableName);
+    const getPnlFn = makeFn("GetPnlFn", "pnl", "get.ts", pnlTable.tableName);
+    const updatePnlFn = makeFn("UpdatePnlFn", "pnl", "update.ts", pnlTable.tableName);
+    const deletePnlFn = makeFn("DeletePnlFn", "pnl", "delete.ts", pnlTable.tableName);
+    const listPnlFn = makeFn("ListPnlFn", "pnl", "list.ts", pnlTable.tableName);
+
+    pnlTable.grant(createPnlFn, "dynamodb:PutItem");
+    pnlTable.grant(getPnlFn, "dynamodb:GetItem");
+    pnlTable.grant(updatePnlFn, "dynamodb:PutItem");
+    pnlTable.grant(deletePnlFn, "dynamodb:DeleteItem");
+    pnlTable.grant(listPnlFn, "dynamodb:Scan");
 
     const httpApi = new apigwv2.HttpApi(this, "TradingLogsApi", {
       apiName: "trading-logs-api",
@@ -81,6 +100,32 @@ export class BackendStack extends Stack {
       path: "/logs/{date}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: new integrations.HttpLambdaIntegration("DeleteIntegration", deleteFn),
+    });
+
+    httpApi.addRoutes({
+      path: "/pnl-entries",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration("CreatePnlIntegration", createPnlFn),
+    });
+    httpApi.addRoutes({
+      path: "/pnl-entries",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new integrations.HttpLambdaIntegration("ListPnlIntegration", listPnlFn),
+    });
+    httpApi.addRoutes({
+      path: "/pnl-entries/{date}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new integrations.HttpLambdaIntegration("GetPnlIntegration", getPnlFn),
+    });
+    httpApi.addRoutes({
+      path: "/pnl-entries/{date}",
+      methods: [apigwv2.HttpMethod.PUT],
+      integration: new integrations.HttpLambdaIntegration("UpdatePnlIntegration", updatePnlFn),
+    });
+    httpApi.addRoutes({
+      path: "/pnl-entries/{date}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: new integrations.HttpLambdaIntegration("DeletePnlIntegration", deletePnlFn),
     });
 
     new CfnOutput(this, "ApiUrl", { value: httpApi.apiEndpoint });

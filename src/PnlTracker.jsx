@@ -1,5 +1,6 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
+import { listPnlEntries, upsertPnlEntry, deletePnlEntry } from "./api/pnlEntries";
 
 // ── DESIGN TOKENS ─────────────────────────────────────────────
 const C = {
@@ -13,7 +14,6 @@ const C = {
   blue:"#2D6FA8",  teal:"#1A8E8E",
 };
 
-const STORAGE_KEY = "pnl_tracker_v1";
 const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 
@@ -518,13 +518,8 @@ function LogTab({ days, onSave, onDelete, exportData, importData, clearAll }) {
 
 // ── MAIN APP ──────────────────────────────────────────────────
 export default function PnlTracker() {
-  const [days, setDays] = useState(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch(e) {}
-    return {};
-  });
+  const [days, setDays] = useState({});
+  const [loading, setLoading] = useState(true);
 
   const [tab, setTab] = useState("calendar");
   const [saveStatus, setSaveStatus] = useState("saved");
@@ -534,24 +529,50 @@ export default function PnlTracker() {
   const [ovYear, setOvYear]     = useState(today.getFullYear());
   const [selectedDate, setSelectedDate] = useState(null);
 
+  const saveTimersRef = useRef({});
+
+  // Initial load from the API
   useEffect(()=>{
-    setSaveStatus("saving");
-    const t = setTimeout(()=>{
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(days)); setSaveStatus("saved"); }
-      catch(e) { setSaveStatus("error"); }
-    }, 400);
-    return ()=>clearTimeout(t);
-  },[days]);
+    let cancelled = false;
+    (async ()=>{
+      try {
+        const items = await listPnlEntries();
+        if (cancelled) return;
+        const map = {};
+        items.forEach(item => { map[item.date] = { pnl: item.pnl, trades: item.trades, notes: item.notes }; });
+        setDays(map);
+      } catch(e) {
+        console.error("Failed to load P&L entries", e);
+        setSaveStatus("error");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return ()=>{ cancelled = true; };
+  },[]);
 
   const entries = useMemo(()=>toEntries(days), [days]);
   const stats   = useMemo(()=>computeStats(entries), [entries]);
 
   const saveEntry = useCallback((date, data) => {
     setDays(d => ({ ...d, [date]: data }));
+    clearTimeout(saveTimersRef.current[date]);
+    saveTimersRef.current[date] = setTimeout(async () => {
+      setSaveStatus("saving");
+      try {
+        await upsertPnlEntry({ date, ...data });
+        setSaveStatus("saved");
+      } catch(e) {
+        console.error("Failed to save P&L entry", e);
+        setSaveStatus("error");
+      }
+    }, 500);
   }, []);
   const deleteEntry = useCallback((date) => {
     setDays(d => { const n = {...d}; delete n[date]; return n; });
     setSelectedDate(s => s===date ? null : s);
+    clearTimeout(saveTimersRef.current[date]);
+    deletePnlEntry(date).catch(e=>console.error("Failed to delete P&L entry", e));
   }, []);
 
   const prevMonth = () => { calMonth===0 ? (setCalMonth(11), setCalYear(y=>y-1)) : setCalMonth(m=>m-1); };
@@ -574,23 +595,42 @@ export default function PnlTracker() {
       const file = e.target.files[0]; if(!file) return;
       const reader = new FileReader();
       reader.onload = ev => {
-        try { const parsed = JSON.parse(ev.target.result); if (parsed && typeof parsed==="object") setDays(parsed); }
-        catch { alert("Invalid file."); }
+        try {
+          const parsed = JSON.parse(ev.target.result);
+          if (parsed && typeof parsed==="object") {
+            setDays(parsed);
+            Object.entries(parsed).forEach(([date,data]) => saveEntry(date, data));
+          }
+        } catch { alert("Invalid file."); }
       };
       reader.readAsText(file);
     };
     input.click();
-  },[]);
+  },[saveEntry]);
 
   const clearAll = useCallback(()=>{
     if (window.confirm("Clear all P&L data? This cannot be undone.")) {
-      localStorage.removeItem(STORAGE_KEY);
+      Object.values(saveTimersRef.current).forEach(clearTimeout);
+      saveTimersRef.current = {};
+      Object.keys(days).forEach(date => deletePnlEntry(date).catch(e=>console.error("Failed to delete P&L entry", e)));
       setDays({});
     }
-  },[]);
+  },[days]);
 
   const statusColor = saveStatus==="saved"?C.green:saveStatus==="saving"?C.amber:C.red;
   const statusLabel = saveStatus==="saved"?"Auto-saved":saveStatus==="saving"?"Saving…":"Save error";
+
+  if (loading) {
+    return (
+      <div style={{
+        background:C.bg,color:C.muted,minHeight:"100vh",
+        display:"flex",alignItems:"center",justifyContent:"center",
+        fontFamily:"'Inter',system-ui,sans-serif",fontSize:13
+      }}>
+        Loading P&amp;L data…
+      </div>
+    );
+  }
 
   return (
     <div style={{background:C.bg,color:C.text,minHeight:"100vh",
@@ -619,7 +659,7 @@ export default function PnlTracker() {
             <span style={{fontSize:10,fontWeight:600,textTransform:"uppercase",
               letterSpacing:"0.06em",color:statusColor}}>{statusLabel}</span>
           </div>
-          <div style={{fontSize:10,color:C.dim}}>Saved to browser localStorage</div>
+          <div style={{fontSize:10,color:C.dim}}>Synced to AWS</div>
         </div>
       </div>
 

@@ -1,8 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
-
-// ── STORAGE KEY ────────────────────────────────────────────────
-const STORAGE_KEY = "nq_obs_log_v2";
+import { listLogs, upsertLog, deleteLog } from "./api/tradingLogs";
 
 // ── DESIGN TOKENS ─────────────────────────────────────────────
 const C = {
@@ -685,36 +683,89 @@ function GuideTab() {
 
 // ── MAIN APP ──────────────────────────────────────────────────
 export default function App() {
-  const [days, setDays] = useState(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length>0) return parsed;
-      }
-    } catch(e) {}
-    return Array.from({length:30},()=>emptyDay());
-  });
-
+  const [days, setDays] = useState(() => Array.from({length:30},()=>emptyDay()));
   const [tab,        setTab]        = useState("log");
   const [filter,     setFilter]     = useState("");
   const [saveStatus, setSaveStatus] = useState("saved");
+  const [loading,    setLoading]    = useState(true);
 
-  // Auto-save
+  // Tracks the date each day.id was last successfully synced to, so edits can be
+  // routed to update-vs-create and a date change can clean up the old item.
+  const persistedDatesRef = useRef(new Map());
+  const saveTimersRef     = useRef({});
+
+  // Initial load from the API
   useEffect(()=>{
-    setSaveStatus("saving");
-    const t = setTimeout(()=>{
+    let cancelled = false;
+    (async ()=>{
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(days));
-        setSaveStatus("saved");
-      } catch(e) { setSaveStatus("error"); }
-    }, 400);
-    return ()=>clearTimeout(t);
-  },[days]);
+        const items = await listLogs();
+        if (cancelled) return;
+        if (items.length > 0) {
+          const loaded = items
+            .slice()
+            .sort((a,b)=>a.date.localeCompare(b.date))
+            .map(item => {
+              const day = { ...emptyDay(), ...item, trades: item.trades?.length ? item.trades : [emptyTrade()] };
+              persistedDatesRef.current.set(day.id, item.date);
+              return day;
+            });
+          while (loaded.length < 30) loaded.push(emptyDay());
+          setDays(loaded);
+        }
+      } catch(e) {
+        console.error("Failed to load trading logs", e);
+        setSaveStatus("error");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return ()=>{ cancelled = true; };
+  },[]);
 
-  const updateDay = (id, updated) => setDays(days.map(d=>d.id===id?updated:d));
-  const deleteDay = (id)          => setDays(days.map(d=>d.id===id?emptyDay():d));
-  const addDay    = ()            => setDays([...days, emptyDay()]);
+  const saveDay = useCallback((day) => {
+    clearTimeout(saveTimersRef.current[day.id]);
+    saveTimersRef.current[day.id] = setTimeout(async () => {
+      const prevDate = persistedDatesRef.current.get(day.id);
+      setSaveStatus("saving");
+      try {
+        if (!day.date) {
+          if (prevDate) {
+            await deleteLog(prevDate);
+            persistedDatesRef.current.delete(day.id);
+          }
+        } else {
+          if (prevDate && prevDate !== day.date) {
+            await deleteLog(prevDate).catch(()=>{});
+          }
+          const { id, ...payload } = day;
+          await upsertLog(payload);
+          persistedDatesRef.current.set(day.id, day.date);
+        }
+        setSaveStatus("saved");
+      } catch(e) {
+        console.error("Failed to save trading log", e);
+        setSaveStatus("error");
+      }
+    }, 500);
+  }, []);
+
+  const updateDay = (id, updated) => {
+    setDays(days.map(d=>d.id===id?updated:d));
+    saveDay(updated);
+  };
+
+  const deleteDay = (id) => {
+    const prevDate = persistedDatesRef.current.get(id);
+    if (prevDate) {
+      persistedDatesRef.current.delete(id);
+      deleteLog(prevDate).catch(e=>console.error("Failed to delete trading log", e));
+    }
+    clearTimeout(saveTimersRef.current[id]);
+    setDays(days.map(d=>d.id===id?emptyDay():d));
+  };
+
+  const addDay = () => setDays([...days, emptyDay()]);
 
   const exportData = useCallback(()=>{
     const blob = new Blob([JSON.stringify(days,null,2)],{type:"application/json"});
@@ -733,17 +784,24 @@ export default function App() {
       reader.onload = ev => {
         try {
           const parsed = JSON.parse(ev.target.result);
-          if(Array.isArray(parsed)) setDays(parsed);
+          if(Array.isArray(parsed)) {
+            setDays(parsed);
+            parsed.forEach(day => { if (day.date) saveDay(day); });
+          }
         } catch { alert("Invalid file."); }
       };
       reader.readAsText(file);
     };
     input.click();
-  },[]);
+  },[saveDay]);
 
   const clearAll = useCallback(()=>{
     if(window.confirm("Clear all data? This cannot be undone.")) {
-      localStorage.removeItem(STORAGE_KEY);
+      Object.values(saveTimersRef.current).forEach(clearTimeout);
+      saveTimersRef.current = {};
+      const dates = [...persistedDatesRef.current.values()];
+      persistedDatesRef.current = new Map();
+      dates.forEach(date => deleteLog(date).catch(e=>console.error("Failed to delete trading log", e)));
       setDays(Array.from({length:30},()=>emptyDay()));
     }
   },[]);
@@ -763,6 +821,18 @@ export default function App() {
 
   const statusColor = saveStatus==="saved"?C.green:saveStatus==="saving"?C.amber:C.red;
   const statusLabel = saveStatus==="saved"?"Auto-saved":saveStatus==="saving"?"Saving…":"Save error";
+
+  if (loading) {
+    return (
+      <div style={{
+        background:C.bg,color:C.muted,minHeight:"100vh",
+        display:"flex",alignItems:"center",justifyContent:"center",
+        fontFamily:"'Inter',system-ui,sans-serif",fontSize:13
+      }}>
+        Loading trading logs…
+      </div>
+    );
+  }
 
   return (
     <div style={{
@@ -805,7 +875,7 @@ export default function App() {
               ))
             }
           </div>
-          <div style={{fontSize:10,color:C.dim}}>Saved to browser localStorage</div>
+          <div style={{fontSize:10,color:C.dim}}>Synced to AWS</div>
         </div>
       </div>
 

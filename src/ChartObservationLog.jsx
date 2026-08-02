@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Link } from "react-router-dom";
 import { listLogs, upsertLog, deleteLog } from "./api/tradingLogs";
 
@@ -26,6 +26,34 @@ const ATR_STATES    = ["Trending ↑","Trending ↓","Flip Long","Flip Short","C
 const QUALITY       = ["A","B","C","Skip"];
 const REGIMES       = ["RTH Only","Overnight Gap","London Driven","News Driven"];
 
+// ── DATE HELPERS ──────────────────────────────────────────────
+const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+const pad = (n) => String(n).padStart(2,"0");
+const fmtDate = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const todayStr = () => fmtDate(new Date());
+const parseDate = (s) => { const [y,m,d] = s.split("-").map(Number); return new Date(y,m-1,d); };
+
+function buildMonthWeeks(year, month) {
+  const firstOfMonth = new Date(year, month, 1);
+  const lastOfMonth  = new Date(year, month+1, 0);
+  const start = new Date(firstOfMonth); start.setDate(start.getDate() - start.getDay());
+  const end   = new Date(lastOfMonth);  end.setDate(end.getDate() + (6 - end.getDay()));
+  const weeks = [];
+  let cur = new Date(start);
+  const today = todayStr();
+  while (cur <= end) {
+    const week = [];
+    for (let i=0;i<7;i++) {
+      const ds = fmtDate(cur);
+      week.push({ date: ds, day: cur.getDate(), otherMonth: cur.getMonth()!==month, isToday: ds===today });
+      cur.setDate(cur.getDate()+1);
+    }
+    weeks.push(week);
+  }
+  return weeks;
+}
+
 // ── EMPTY TRADE ───────────────────────────────────────────────
 let tradeCounter = 0;
 const emptyTrade = () => ({
@@ -44,11 +72,8 @@ const emptyTrade = () => ({
   lesson:    "",
 });
 
-// ── EMPTY DAY ─────────────────────────────────────────────────
-let dayCounter = 0;
-const emptyDay = () => ({
-  id:          ++dayCounter,
-  date:        "",
+// ── EMPTY DAY DATA ────────────────────────────────────────────
+const emptyDayData = () => ({
   sessionType: "",
   openType:    "",
   regime:      "",
@@ -64,7 +89,7 @@ const emptyDay = () => ({
   sessionClassCorrect: "",
   dayNotes:    "",
   bestSetup:   "",
-  trades:      [emptyTrade()],
+  trades:      [],
 });
 
 // ── HELPERS ───────────────────────────────────────────────────
@@ -84,6 +109,14 @@ const qualityColor = (q) => {
   return C.dim;
 };
 const dirColor = (d) => d==="Long" ? C.green : d==="Short" ? C.red : C.muted;
+const sessionBg = (sessionType) => !sessionType ? "transparent"
+  : sessionType.includes("Trend") ? C.greenDim
+  : sessionType==="Ranging" ? C.purpleDim
+  : sessionType==="Choppy"  ? C.redDim : C.blueDim;
+const sessionTxt = (sessionType) => !sessionType ? C.muted
+  : sessionType.includes("Trend") ? C.green
+  : sessionType==="Ranging" ? "#A090E0"
+  : sessionType==="Choppy"  ? C.red : "#6AAEDC";
 
 // ── PRIMITIVE COMPONENTS ──────────────────────────────────────
 const Label = ({children, color}) => (
@@ -140,16 +173,8 @@ const SecHead = ({children, color}) => (
   </div>
 );
 
-const Btn = ({children, onClick, color, variant="solid"}) => (
-  <button onClick={onClick} style={{
-    padding:"5px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",
-    background:variant==="solid"?`${color}22`:"transparent",color,
-    border:`1px solid ${variant==="solid"?`${color}55`:C.border2}`,transition:"all 0.15s"
-  }}>{children}</button>
-);
-
 // ── TRADE ROW ─────────────────────────────────────────────────
-function TradeRow({ trade, index, onChange, onDelete, isOnly }) {
+function TradeRow({ trade, index, onChange, onDelete }) {
   const [open, setOpen] = useState(true);
   const upd = (k,v) => onChange({...trade,[k]:v});
   const toggleSig = (s) => upd("signals",
@@ -215,12 +240,10 @@ function TradeRow({ trade, index, onChange, onDelete, isOnly }) {
         </div>
 
         <div style={{display:"flex",gap:4,alignItems:"center"}}>
-          {!isOnly && (
-            <button onClick={e=>{e.stopPropagation();onDelete();}} style={{
-              fontSize:10,color:C.muted,background:"transparent",
-              border:`1px solid ${C.border}`,borderRadius:4,padding:"1px 6px",cursor:"pointer"
-            }}>✕</button>
-          )}
+          <button onClick={e=>{e.stopPropagation();onDelete();}} title="Delete trade" style={{
+            fontSize:10,color:C.muted,background:"transparent",
+            border:`1px solid ${C.border}`,borderRadius:4,padding:"1px 6px",cursor:"pointer"
+          }}>✕</button>
           <span style={{fontSize:14,color:C.muted}}>{open?"▾":"▸"}</span>
         </div>
       </div>
@@ -302,9 +325,8 @@ function TradeRow({ trade, index, onChange, onDelete, isOnly }) {
   );
 }
 
-// ── DAY CARD ──────────────────────────────────────────────────
-function DayCard({ day, index, onChange, onDelete }) {
-  const [open, setOpen] = useState(index===0);
+// ── DAY EDITOR ────────────────────────────────────────────────
+function DayEditor({ date, day, hasEntry, onChange, onDelete, onClose }) {
   const upd = (k,v) => onChange({...day,[k]:v});
 
   const updateTrade = (id, updated) =>
@@ -314,67 +336,36 @@ function DayCard({ day, index, onChange, onDelete }) {
   const addTrade = () =>
     upd("trades", [...day.trades, emptyTrade()]);
 
-  // Day-level stats
   const wins   = day.trades.filter(t=>t.outcome==="Target Hit").length;
   const losses = day.trades.filter(t=>t.outcome==="Stop Out").length;
   const total  = wins+losses;
   const wr     = total ? Math.round(wins/total*100) : null;
   const dayPnl = day.trades.reduce((a,t)=>a+(parseFloat(t.pnl)||0),0);
-  const hasData = day.date || day.sessionType || day.trades.some(t=>t.outcome);
-
-  const sessionBg = day.sessionType
-    ? day.sessionType.includes("Trend") ? C.greenDim
-    : day.sessionType==="Ranging" ? C.purpleDim
-    : day.sessionType==="Choppy"  ? C.redDim : C.blueDim
-    : C.border;
-  const sessionTxt = day.sessionType
-    ? day.sessionType.includes("Trend") ? C.green
-    : day.sessionType==="Ranging" ? "#A090E0"
-    : day.sessionType==="Choppy"  ? C.red : "#6AAEDC"
-    : C.muted;
 
   return (
     <div style={{
-      background:C.card,
-      border:`1px solid ${hasData?C.border2:C.border}`,
-      borderLeft:`3px solid ${day.sessionType ? sessionBg : C.border2}`,
-      borderRadius:10,marginBottom:12,overflow:"hidden"
+      background:C.card,border:`1px solid ${C.border2}`,
+      borderLeft:`3px solid ${day.sessionType ? sessionBg(day.sessionType) : C.purple}`,
+      borderRadius:10,padding:"14px 16px",marginTop:14
     }}>
-      {/* Day header */}
-      <div onClick={()=>setOpen(!open)} style={{
-        display:"flex",alignItems:"center",gap:10,
-        padding:"11px 16px",cursor:"pointer",userSelect:"none"
-      }}>
-        {/* Day number */}
-        <div style={{
-          width:28,height:28,borderRadius:6,background:C.surface,
-          display:"flex",alignItems:"center",justifyContent:"center",
-          fontSize:11,fontWeight:700,color:C.muted,flexShrink:0
-        }}>{index+1}</div>
-
-        {/* Summary */}
-        <div style={{flex:1,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
-          {day.date
-            ? <span style={{fontSize:13,fontWeight:700,color:C.text,fontFamily:"monospace"}}>{day.date}</span>
-            : <span style={{fontSize:12,color:C.dim}}>Day {index+1} — not filled</span>
-          }
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        marginBottom:12,flexWrap:"wrap",gap:8}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+          <div style={{fontSize:14,fontWeight:700,color:C.text,fontFamily:"monospace"}}>{date}</div>
           {day.sessionType && (
             <span style={{fontSize:11,fontWeight:600,padding:"2px 8px",borderRadius:4,
-              background:sessionBg,color:sessionTxt}}>{day.sessionType}</span>
+              background:sessionBg(day.sessionType),color:sessionTxt(day.sessionType)}}>{day.sessionType}</span>
           )}
           {day.trades.length>0 && (
             <span style={{fontSize:11,color:C.muted}}>{day.trades.length} trade{day.trades.length!==1?"s":""}</span>
           )}
           {wr!==null && (
-            <span style={{fontSize:11,fontWeight:600,color:wr>=60?C.green:wr>=40?C.amber:C.red}}>
-              {wr}% WR
-            </span>
+            <span style={{fontSize:11,fontWeight:600,color:wr>=60?C.green:wr>=40?C.amber:C.red}}>{wr}% WR</span>
           )}
           {dayPnl!==0 && (
             <span style={{fontSize:12,fontWeight:700,fontFamily:"monospace",
-              color:dayPnl>=0?C.green:C.red}}>
-              {dayPnl>=0?"+":""}{dayPnl.toFixed(0)}
-            </span>
+              color:dayPnl>=0?C.green:C.red}}>{dayPnl>=0?"+":""}{dayPnl.toFixed(0)}</span>
           )}
           {day.sessionClassCorrect && (
             <span style={{fontSize:10,padding:"1px 5px",borderRadius:3,
@@ -384,104 +375,178 @@ function DayCard({ day, index, onChange, onDelete }) {
             </span>
           )}
         </div>
-
-        <div style={{display:"flex",gap:6,alignItems:"center"}}>
-          <button onClick={e=>{e.stopPropagation();onDelete();}} style={{
-            fontSize:10,color:C.muted,background:"transparent",
-            border:`1px solid ${C.border}`,borderRadius:4,padding:"2px 7px",cursor:"pointer"
-          }}>✕</button>
-          <span style={{fontSize:16,color:C.muted}}>{open?"▾":"▸"}</span>
+        <div style={{display:"flex",gap:6,flexShrink:0}}>
+          {hasEntry && (
+            <button onClick={onDelete} style={{fontSize:11,color:C.red,
+              background:C.redDim,border:`1px solid ${C.red}44`,borderRadius:4,
+              padding:"3px 10px",cursor:"pointer"}}>✕ Delete Day</button>
+          )}
+          <button onClick={onClose} style={{fontSize:11,color:C.muted,background:"transparent",
+            border:`1px solid ${C.border}`,borderRadius:4,padding:"3px 10px",cursor:"pointer"}}>Close</button>
         </div>
       </div>
 
-      {/* Day body */}
-      {open && (
-        <div style={{padding:"0 16px 16px",display:"flex",flexDirection:"column",gap:14}}>
+      <div style={{display:"flex",flexDirection:"column",gap:14}}>
 
-          {/* Session context */}
-          <div>
-            <SecHead color={C.purple}>Session Context</SecHead>
-            <div style={{display:"grid",gridTemplateColumns:"140px 140px 1fr 1fr 1fr",gap:10,marginBottom:10}}>
-              <div><Label>Date</Label><Inp value={day.date} onChange={v=>upd("date",v)} type="date" mono/></div>
-              <div><Label>Session Type</Label><Sel value={day.sessionType} onChange={v=>upd("sessionType",v)} options={SESSION_TYPES} placeholder="Classify…"/></div>
-              <div><Label>Open Type</Label><Sel value={day.openType} onChange={v=>upd("openType",v)} options={OPEN_TYPES} placeholder="Open…"/></div>
-              <div><Label>ATR State</Label><Sel value={day.atrState} onChange={v=>upd("atrState",v)} options={ATR_STATES} placeholder="ATR…"/></div>
-              <div><Label>Delta Bias</Label><Sel value={day.deltaBias} onChange={v=>upd("deltaBias",v)} options={DELTA_BIAS} placeholder="Delta…"/></div>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              <div><Label>Regime</Label><Sel value={day.regime} onChange={v=>upd("regime",v)} options={REGIMES} placeholder="Regime…"/></div>
-              <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
-                <div style={{flex:1}}>
-                  <Label>Session Class Correct?</Label>
-                  <div style={{display:"flex",gap:5}}>
-                    {["Yes","No","N/A"].map(opt=>(
-                      <Pill key={opt} label={opt} active={day.sessionClassCorrect===opt}
-                        color={opt==="Yes"?C.green:opt==="No"?C.red:C.amber}
-                        onClick={()=>upd("sessionClassCorrect",opt)}/>
-                    ))}
-                  </div>
-                </div>
+        {/* Session context */}
+        <div>
+          <SecHead color={C.purple}>Session Context</SecHead>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:10,marginBottom:10}}>
+            <div><Label>Session Type</Label><Sel value={day.sessionType} onChange={v=>upd("sessionType",v)} options={SESSION_TYPES} placeholder="Classify…"/></div>
+            <div><Label>Open Type</Label><Sel value={day.openType} onChange={v=>upd("openType",v)} options={OPEN_TYPES} placeholder="Open…"/></div>
+            <div><Label>ATR State</Label><Sel value={day.atrState} onChange={v=>upd("atrState",v)} options={ATR_STATES} placeholder="ATR…"/></div>
+            <div><Label>Delta Bias</Label><Sel value={day.deltaBias} onChange={v=>upd("deltaBias",v)} options={DELTA_BIAS} placeholder="Delta…"/></div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div><Label>Regime</Label><Sel value={day.regime} onChange={v=>upd("regime",v)} options={REGIMES} placeholder="Regime…"/></div>
+            <div style={{display:"flex",gap:8,alignItems:"flex-end"}}>
+              <div style={{flex:1}}>
+                <Label>Session Class Correct?</Label>
                 <div style={{display:"flex",gap:5}}>
-                  <Tog label="Vol Spike" value={day.volSpike} onChange={v=>upd("volSpike",v)} color={C.green}/>
-                  <Tog label="Range Expand" value={day.rangeExpand} onChange={v=>upd("rangeExpand",v)} color={C.amber}/>
-                  <Tog label="Sweep" value={day.sweep} onChange={v=>upd("sweep",v)} color={C.red}/>
+                  {["Yes","No","N/A"].map(opt=>(
+                    <Pill key={opt} label={opt} active={day.sessionClassCorrect===opt}
+                      color={opt==="Yes"?C.green:opt==="No"?C.red:C.amber}
+                      onClick={()=>upd("sessionClassCorrect",opt)}/>
+                  ))}
                 </div>
+              </div>
+              <div style={{display:"flex",gap:5}}>
+                <Tog label="Vol Spike" value={day.volSpike} onChange={v=>upd("volSpike",v)} color={C.green}/>
+                <Tog label="Range Expand" value={day.rangeExpand} onChange={v=>upd("rangeExpand",v)} color={C.amber}/>
+                <Tog label="Sweep" value={day.sweep} onChange={v=>upd("sweep",v)} color={C.red}/>
               </div>
             </div>
           </div>
+        </div>
 
-          {/* VP levels */}
-          <div>
-            <SecHead color={C.purple}>Volume Profile Levels</SecHead>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:8}}>
-              {[["pdVAH","pdVAH"],["pdVAL","pdVAL"],["pdPOC","pdPOC"],
-                ["VAH","vah"],["VAL","val"],["POC","poc"],["LVN","lvn"]
-              ].map(([label,key])=>(
-                <div key={key}>
-                  <Label>{label}</Label>
-                  <Inp value={day[key]} onChange={v=>upd(key,v)} placeholder="—" mono/>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Trades section */}
-          <div>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-              <SecHead color={C.green}>Trades ({day.trades.length})</SecHead>
-              <button onClick={addTrade} style={{
-                padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,
-                background:C.greenDim,color:C.green,border:`1px solid ${C.green}44`,
-                cursor:"pointer",marginBottom:8
-              }}>+ Add Trade</button>
-            </div>
-            {day.trades.map((trade,i)=>(
-              <TradeRow key={trade.id} trade={trade} index={i}
-                isOnly={day.trades.length===1}
-                onChange={updated=>updateTrade(trade.id,updated)}
-                onDelete={()=>deleteTrade(trade.id)}/>
+        {/* VP levels */}
+        <div>
+          <SecHead color={C.purple}>Volume Profile Levels</SecHead>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:8}}>
+            {[["pdVAH","pdVAH"],["pdVAL","pdVAL"],["pdPOC","pdPOC"],
+              ["VAH","vah"],["VAL","val"],["POC","poc"],["LVN","lvn"]
+            ].map(([label,key])=>(
+              <div key={key}>
+                <Label>{label}</Label>
+                <Inp value={day[key]} onChange={v=>upd(key,v)} placeholder="—" mono/>
+              </div>
             ))}
           </div>
+        </div>
 
-          {/* Day summary */}
-          <div>
-            <SecHead color={C.amber}>Day Summary</SecHead>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-              <div>
-                <Label>Best Setup of the Day</Label>
-                <Area value={day.bestSetup} onChange={v=>upd("bestSetup",v)}
-                  placeholder="Describe the one highest-quality setup — taken or missed." rows={2}/>
-              </div>
-              <div>
-                <Label>Day Notes / Observations</Label>
-                <Area value={day.dayNotes} onChange={v=>upd("dayNotes",v)}
-                  placeholder="Overall session character, unusual behaviour, patterns noticed." rows={2}/>
-              </div>
+        {/* Trades section */}
+        <div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+            <SecHead color={C.green}>Trades ({day.trades.length})</SecHead>
+            <button onClick={addTrade} style={{
+              padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,
+              background:C.greenDim,color:C.green,border:`1px solid ${C.green}44`,
+              cursor:"pointer",marginBottom:8
+            }}>+ Add Trade</button>
+          </div>
+          {day.trades.length===0 && (
+            <div style={{fontSize:12,color:C.muted,padding:"10px 0"}}>No trades logged for this day yet.</div>
+          )}
+          {day.trades.map((trade,i)=>(
+            <TradeRow key={trade.id} trade={trade} index={i}
+              onChange={updated=>updateTrade(trade.id,updated)}
+              onDelete={()=>deleteTrade(trade.id)}/>
+          ))}
+        </div>
+
+        {/* Day summary */}
+        <div>
+          <SecHead color={C.amber}>Day Summary</SecHead>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div>
+              <Label>Best Setup of the Day</Label>
+              <Area value={day.bestSetup} onChange={v=>upd("bestSetup",v)}
+                placeholder="Describe the one highest-quality setup — taken or missed." rows={2}/>
+            </div>
+            <div>
+              <Label>Day Notes / Observations</Label>
+              <Area value={day.dayNotes} onChange={v=>upd("dayNotes",v)}
+                placeholder="Overall session character, unusual behaviour, patterns noticed." rows={2}/>
             </div>
           </div>
-
         </div>
-      )}
+
+      </div>
+    </div>
+  );
+}
+
+// ── MONTH CALENDAR ────────────────────────────────────────────
+function MonthCalendar({ days, year, month, onPrev, onNext, onToday, selectedDate, onSelect }) {
+  const weeks = useMemo(()=>buildMonthWeeks(year,month), [year,month]);
+
+  const monthStats = useMemo(()=>{
+    let loggedDays=0, trades=0;
+    Object.entries(days).forEach(([d,entry])=>{
+      const dt = parseDate(d);
+      if (dt.getFullYear()===year && dt.getMonth()===month) {
+        loggedDays++;
+        trades += entry.trades.length;
+      }
+    });
+    return { loggedDays, trades };
+  }, [days, year, month]);
+
+  return (
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"16px 18px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <button onClick={onPrev} style={{width:26,height:26,borderRadius:6,background:C.surface,
+            color:C.muted,border:`1px solid ${C.border2}`,cursor:"pointer",fontSize:13}}>‹</button>
+          <div style={{fontSize:15,fontWeight:700,color:C.text,minWidth:150,textAlign:"center"}}>
+            {MONTH_NAMES[month]} {year}
+          </div>
+          <button onClick={onNext} style={{width:26,height:26,borderRadius:6,background:C.surface,
+            color:C.muted,border:`1px solid ${C.border2}`,cursor:"pointer",fontSize:13}}>›</button>
+          <button onClick={onToday} style={{marginLeft:4,padding:"4px 10px",borderRadius:6,fontSize:10,
+            fontWeight:600,background:"transparent",color:C.purple,border:`1px solid ${C.purple}55`,cursor:"pointer"}}>Today</button>
+        </div>
+        <div style={{fontSize:11,color:C.muted}}>
+          {monthStats.loggedDays} day{monthStats.loggedDays!==1?"s":""} logged · {monthStats.trades} trade{monthStats.trades!==1?"s":""}
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+        {DOW.map(d=>(
+          <div key={d} style={{fontSize:9,fontWeight:700,color:C.muted,textAlign:"center",
+            textTransform:"uppercase",letterSpacing:"0.06em",padding:"2px 0"}}>{d}</div>
+        ))}
+      </div>
+
+      {weeks.map((week,wi)=>(
+        <div key={wi} style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:4}}>
+          {week.map(cell=>{
+            const entry = days[cell.date];
+            const isSelected = cell.date===selectedDate;
+            return (
+              <div key={cell.date} onClick={()=>onSelect(cell.date)}
+                style={{
+                  minHeight:64,borderRadius:6,padding:"6px 7px",cursor:"pointer",
+                  background: isSelected ? `${C.purple}22` : sessionBg(entry?.sessionType),
+                  border:`1px solid ${isSelected?C.purple:cell.isToday?C.amber:"transparent"}`,
+                  opacity: cell.otherMonth?0.35:1,
+                  display:"flex",flexDirection:"column",justifyContent:"space-between",
+                }}>
+                <div style={{fontSize:10,color:cell.isToday?C.amber:C.muted,fontWeight:cell.isToday?800:600}}>{cell.day}</div>
+                {entry && (
+                  <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                    {entry.trades.length>0 && (
+                      <div style={{fontSize:10,fontWeight:600,color:C.muted}}>
+                        {entry.trades.length} trade{entry.trades.length!==1?"s":""}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -495,7 +560,7 @@ function StatsBar({ days }) {
   const wr         = total ? Math.round(wins/total*100) : null;
   const netPnl     = allTrades.reduce((a,t)=>a+(parseFloat(t.pnl)||0),0);
   const aGrade     = allTrades.filter(t=>t.quality==="A").length;
-  const daysLogged = days.filter(d=>d.date).length;
+  const daysLogged = days.length;
   const classified = days.filter(d=>d.sessionClassCorrect).length;
   const correct    = days.filter(d=>d.sessionClassCorrect==="Yes").length;
   const classAcc   = classified ? Math.round(correct/classified*100) : null;
@@ -521,12 +586,6 @@ function StatsBar({ days }) {
       {stat("Avg/Day",avgPnl?`$${avgPnl}`:"—",parseFloat(avgPnl)>=0?C.green:C.red)}
       {stat("A-Grade",aGrade,C.green)}
       {stat("Class Acc",classAcc!==null?`${classAcc}%`:"—",classAcc===null?C.muted:classAcc>=70?C.green:C.amber)}
-      <div style={{textAlign:"center",padding:"0 14px"}}>
-        <div style={{fontSize:20,fontWeight:700,color:C.purple,fontFamily:"'JetBrains Mono',monospace",lineHeight:1}}>
-          {Math.max(0,30-daysLogged)}
-        </div>
-        <div style={{fontSize:9,color:C.muted,marginTop:4,textTransform:"uppercase",letterSpacing:"0.06em"}}>Days Left</div>
-      </div>
     </div>
   );
 }
@@ -534,7 +593,7 @@ function StatsBar({ days }) {
 // ── SUMMARY TAB ───────────────────────────────────────────────
 function SummaryTab({ days }) {
   const allTrades = days.flatMap(d=>d.trades);
-  const daysLogged = days.filter(d=>d.date);
+  const daysLogged = days;
 
   // Signal frequency
   const sigCount = {};
@@ -573,7 +632,7 @@ function SummaryTab({ days }) {
 
   if (daysLogged.length===0) return (
     <div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
-      No data yet — fill in the Observation Log first.
+      No data in the last 30 days — log a day in the Calendar tab first.
     </div>
   );
 
@@ -684,16 +743,16 @@ function GuideTab() {
 
 // ── MAIN APP ──────────────────────────────────────────────────
 export default function App() {
-  const [days, setDays] = useState(() => Array.from({length:30},()=>emptyDay()));
-  const [tab,        setTab]        = useState("log");
-  const [filter,     setFilter]     = useState("");
+  const [days, setDays] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("calendar");
   const [saveStatus, setSaveStatus] = useState("saved");
-  const [loading,    setLoading]    = useState(true);
+  const today = new Date();
+  const [calYear, setCalYear]   = useState(today.getFullYear());
+  const [calMonth, setCalMonth] = useState(today.getMonth());
+  const [selectedDate, setSelectedDate] = useState(null);
 
-  // Tracks the date each day.id was last successfully synced to, so edits can be
-  // routed to update-vs-create and a date change can clean up the old item.
-  const persistedDatesRef = useRef(new Map());
-  const saveTimersRef     = useRef({});
+  const saveTimersRef = useRef({});
 
   // Initial load from the API
   useEffect(()=>{
@@ -702,18 +761,16 @@ export default function App() {
       try {
         const items = await listLogs();
         if (cancelled) return;
-        if (items.length > 0) {
-          const loaded = items
-            .slice()
-            .sort((a,b)=>a.date.localeCompare(b.date))
-            .map(item => {
-              const day = { ...emptyDay(), ...item, trades: item.trades?.length ? item.trades : [emptyTrade()] };
-              persistedDatesRef.current.set(day.id, item.date);
-              return day;
-            });
-          while (loaded.length < 30) loaded.push(emptyDay());
-          setDays(loaded);
-        }
+        const map = {};
+        items.forEach(item => {
+          const { date, trades, ...rest } = item;
+          map[date] = {
+            ...emptyDayData(),
+            ...rest,
+            trades: (trades||[]).map(t=>({ ...t, id: ++tradeCounter })),
+          };
+        });
+        setDays(map);
       } catch(e) {
         console.error("Failed to load trading logs", e);
         setSaveStatus("error");
@@ -724,25 +781,23 @@ export default function App() {
     return ()=>{ cancelled = true; };
   },[]);
 
-  const saveDay = useCallback((day) => {
-    clearTimeout(saveTimersRef.current[day.id]);
-    saveTimersRef.current[day.id] = setTimeout(async () => {
-      const prevDate = persistedDatesRef.current.get(day.id);
+  const daysArray = useMemo(()=>
+    Object.entries(days).map(([date,d])=>({date,...d})),
+  [days]);
+
+  const rolling30 = useMemo(()=>{
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate()-29);
+    const cutoffStr = fmtDate(cutoff);
+    return daysArray.filter(d=>d.date>=cutoffStr).sort((a,b)=>a.date.localeCompare(b.date));
+  }, [daysArray]);
+
+  const saveDay = useCallback((date, dayData) => {
+    clearTimeout(saveTimersRef.current[date]);
+    saveTimersRef.current[date] = setTimeout(async () => {
       setSaveStatus("saving");
       try {
-        if (!day.date) {
-          if (prevDate) {
-            await deleteLog(prevDate);
-            persistedDatesRef.current.delete(day.id);
-          }
-        } else {
-          if (prevDate && prevDate !== day.date) {
-            await deleteLog(prevDate).catch(()=>{});
-          }
-          const { id, ...payload } = day;
-          await upsertLog(payload);
-          persistedDatesRef.current.set(day.id, day.date);
-        }
+        await upsertLog({ date, ...dayData });
         setSaveStatus("saved");
       } catch(e) {
         console.error("Failed to save trading log", e);
@@ -751,28 +806,27 @@ export default function App() {
     }, 500);
   }, []);
 
-  const updateDay = (id, updated) => {
-    setDays(days.map(d=>d.id===id?updated:d));
-    saveDay(updated);
+  const updateDay = (date, updated) => {
+    setDays(d => ({ ...d, [date]: updated }));
+    saveDay(date, updated);
   };
 
-  const deleteDay = (id) => {
-    const prevDate = persistedDatesRef.current.get(id);
-    if (prevDate) {
-      persistedDatesRef.current.delete(id);
-      deleteLog(prevDate).catch(e=>console.error("Failed to delete trading log", e));
-    }
-    clearTimeout(saveTimersRef.current[id]);
-    setDays(days.map(d=>d.id===id?emptyDay():d));
+  const deleteDay = (date) => {
+    setDays(d => { const n = {...d}; delete n[date]; return n; });
+    setSelectedDate(s => s===date ? null : s);
+    clearTimeout(saveTimersRef.current[date]);
+    deleteLog(date).catch(e=>console.error("Failed to delete trading log", e));
   };
 
-  const addDay = () => setDays([...days, emptyDay()]);
+  const prevMonth = () => { calMonth===0 ? (setCalMonth(11), setCalYear(y=>y-1)) : setCalMonth(m=>m-1); };
+  const nextMonth = () => { calMonth===11 ? (setCalMonth(0), setCalYear(y=>y+1)) : setCalMonth(m=>m+1); };
+  const goToday   = () => { setCalYear(today.getFullYear()); setCalMonth(today.getMonth()); setSelectedDate(todayStr()); };
 
   const exportData = useCallback(()=>{
     const blob = new Blob([JSON.stringify(days,null,2)],{type:"application/json"});
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
-    a.href=url; a.download=`nq_obs_log_${new Date().toISOString().slice(0,10)}.json`;
+    a.href=url; a.download=`chart_observation_log_${todayStr()}.json`;
     a.click(); URL.revokeObjectURL(url);
   },[days]);
 
@@ -785,10 +839,18 @@ export default function App() {
       reader.onload = ev => {
         try {
           const parsed = JSON.parse(ev.target.result);
-          if(Array.isArray(parsed)) {
-            setDays(parsed);
-            parsed.forEach(day => { if (day.date) saveDay(day); });
+          if (!parsed || typeof parsed!=="object") { alert("Invalid file."); return; }
+          let obj;
+          if (Array.isArray(parsed)) {
+            // Backward-compat with the old array-of-days export format.
+            obj = {};
+            // eslint-disable-next-line no-unused-vars
+            parsed.forEach(d => { if (d.date) { const {id, date, ...rest} = d; obj[date] = rest; } });
+          } else {
+            obj = parsed;
           }
+          setDays(obj);
+          Object.entries(obj).forEach(([date,data]) => saveDay(date, data));
         } catch { alert("Invalid file."); }
       };
       reader.readAsText(file);
@@ -800,25 +862,11 @@ export default function App() {
     if(window.confirm("Clear all data? This cannot be undone.")) {
       Object.values(saveTimersRef.current).forEach(clearTimeout);
       saveTimersRef.current = {};
-      const dates = [...persistedDatesRef.current.values()];
-      persistedDatesRef.current = new Map();
-      dates.forEach(date => deleteLog(date).catch(e=>console.error("Failed to delete trading log", e)));
-      setDays(Array.from({length:30},()=>emptyDay()));
+      Object.keys(days).forEach(date => deleteLog(date).catch(e=>console.error("Failed to delete trading log", e)));
+      setDays({});
+      setSelectedDate(null);
     }
-  },[]);
-
-  const filtered = filter
-    ? days.filter(d=>
-        d.date.includes(filter)||
-        d.sessionType.toLowerCase().includes(filter.toLowerCase())||
-        d.dayNotes.toLowerCase().includes(filter.toLowerCase())||
-        d.trades.some(t=>
-          t.notes.toLowerCase().includes(filter.toLowerCase())||
-          t.lesson.toLowerCase().includes(filter.toLowerCase())||
-          t.signals.some(s=>s.toLowerCase().includes(filter.toLowerCase()))
-        )
-      )
-    : days;
+  },[days]);
 
   const statusColor = saveStatus==="saved"?C.green:saveStatus==="saving"?C.amber:C.red;
   const statusLabel = saveStatus==="saved"?"Auto-saved":saveStatus==="saving"?"Saving…":"Save error";
@@ -853,7 +901,7 @@ export default function App() {
              FUTURES TRADING
           </div>
           <h1 style={{margin:"0 0 4px",fontSize:22,fontWeight:700,color:C.text,lineHeight:1.2}}>
-            30-Day Chart Observation Log
+            Chart Observation Log
           </h1>
           <p style={{margin:0,fontSize:12,color:C.muted,lineHeight:1.6}}>
             Volume Profile · ICT/SMC · Delta · Session Classification · Multiple Trades Per Day
@@ -880,12 +928,12 @@ export default function App() {
         </div>
       </div>
 
-      <StatsBar days={days}/>
+      <StatsBar days={daysArray}/>
 
-      {/* Tabs + search */}
+      {/* Tabs */}
       <div style={{display:"flex",gap:6,marginBottom:14,
         borderBottom:`1px solid ${C.border}`,paddingBottom:10,flexWrap:"wrap"}}>
-        {[["log","Observation Log"],["summary","30-Day Summary"],["guide","Field Guide"]].map(([id,label])=>(
+        {[["calendar","Calendar"],["summary","30-Day Summary"],["guide","Field Guide"]].map(([id,label])=>(
           <button key={id} onClick={()=>setTab(id)} style={{
             padding:"6px 14px",borderRadius:6,fontSize:12,fontWeight:600,cursor:"pointer",
             background:tab===id?C.purple:"transparent",
@@ -893,32 +941,24 @@ export default function App() {
             border:`1px solid ${tab===id?C.purple:C.border}`
           }}>{label}</button>
         ))}
-        {tab==="log" && (
-          <div style={{marginLeft:"auto"}}>
-            <input value={filter} onChange={e=>setFilter(e.target.value)}
-              placeholder="Search date, signal, notes, lesson…"
-              style={{background:C.surface,border:`1px solid ${C.border2}`,borderRadius:6,
-                color:C.text,fontSize:12,padding:"6px 12px",width:240,outline:"none"}}/>
-          </div>
-        )}
       </div>
 
-      {tab==="log" && (
+      {tab==="calendar" && (
         <div>
-          {filtered.map((day,i)=>(
-            <DayCard key={day.id} day={day} index={i}
-              onChange={updated=>updateDay(day.id,updated)}
-              onDelete={()=>deleteDay(day.id)}/>
-          ))}
-          <button onClick={addDay} style={{
-            width:"100%",padding:"10px",borderRadius:8,fontSize:12,fontWeight:600,
-            background:"transparent",color:C.muted,border:`1px dashed ${C.border2}`,
-            cursor:"pointer",marginTop:4
-          }}>+ Add observation day</button>
+          <MonthCalendar days={days} year={calYear} month={calMonth}
+            onPrev={prevMonth} onNext={nextMonth} onToday={goToday}
+            selectedDate={selectedDate} onSelect={setSelectedDate}/>
+          {selectedDate && (
+            <DayEditor date={selectedDate} day={days[selectedDate] || emptyDayData()}
+              hasEntry={!!days[selectedDate]}
+              onChange={updated=>updateDay(selectedDate, updated)}
+              onDelete={()=>deleteDay(selectedDate)}
+              onClose={()=>setSelectedDate(null)}/>
+          )}
         </div>
       )}
 
-      {tab==="summary" && <SummaryTab days={days}/>}
+      {tab==="summary" && <SummaryTab days={rolling30}/>}
       {tab==="guide"   && <GuideTab/>}
 
     </div>

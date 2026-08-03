@@ -5,7 +5,12 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaNode from "aws-cdk-lib/aws-lambda-nodejs";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as path from "path";
+
+// Holds the Anthropic API key; created out-of-band via `aws ssm put-parameter` so the
+// secret value itself never appears in this stack or CloudFormation template.
+const ANTHROPIC_API_KEY_PARAM = "/chart-observation-log/anthropic-api-key";
 
 export class BackendStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
@@ -60,6 +65,45 @@ export class BackendStack extends Stack {
     pnlTable.grant(updatePnlFn, "dynamodb:PutItem");
     pnlTable.grant(deletePnlFn, "dynamodb:DeleteItem");
     pnlTable.grant(listPnlFn, "dynamodb:Scan");
+
+    const recsTable = new dynamodb.Table(this, "TradingRecommendationsTable", {
+      tableName: "TradingRecommendations",
+      partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const getRecommendationFn = makeFn("GetRecommendationFn", "recommendations", "get.ts", recsTable.tableName);
+    recsTable.grant(getRecommendationFn, "dynamodb:GetItem");
+
+    const apiKeyParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${ANTHROPIC_API_KEY_PARAM}`;
+
+    const generateRecommendationFn = new lambdaNode.NodejsFunction(this, "GenerateRecommendationFn", {
+      entry: path.join(__dirname, "..", "lambda", "recommendations", "generate.ts"),
+      handler: "handler",
+      runtime: lambda.Runtime.NODEJS_22_X,
+      memorySize: 256,
+      // Capped at the API Gateway HTTP API integration's hard 29s timeout, so the
+      // function fails cleanly instead of running past what the client will ever see.
+      timeout: Duration.seconds(29),
+      environment: {
+        LOGS_TABLE_NAME: table.tableName,
+        RECS_TABLE_NAME: recsTable.tableName,
+        API_KEY_PARAM_NAME: ANTHROPIC_API_KEY_PARAM,
+      },
+      bundling: { minify: true },
+    });
+
+    table.grant(generateRecommendationFn, "dynamodb:Scan");
+    recsTable.grant(generateRecommendationFn, "dynamodb:PutItem");
+    generateRecommendationFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["ssm:GetParameter"],
+      resources: [apiKeyParamArn],
+    }));
+    generateRecommendationFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["kms:Decrypt"],
+      resources: [`arn:aws:kms:${this.region}:${this.account}:alias/aws/ssm`],
+    }));
 
     const httpApi = new apigwv2.HttpApi(this, "TradingLogsApi", {
       apiName: "trading-logs-api",
@@ -126,6 +170,17 @@ export class BackendStack extends Stack {
       path: "/pnl-entries/{date}",
       methods: [apigwv2.HttpMethod.DELETE],
       integration: new integrations.HttpLambdaIntegration("DeletePnlIntegration", deletePnlFn),
+    });
+
+    httpApi.addRoutes({
+      path: "/recommendations",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new integrations.HttpLambdaIntegration("GetRecommendationIntegration", getRecommendationFn),
+    });
+    httpApi.addRoutes({
+      path: "/recommendations/generate",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new integrations.HttpLambdaIntegration("GenerateRecommendationIntegration", generateRecommendationFn),
     });
 
     new CfnOutput(this, "ApiUrl", { value: httpApi.apiEndpoint });

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Link } from "react-router-dom";
 import { listLogs, upsertLog, deleteLog } from "./api/tradingLogs";
+import { getRecommendation, generateRecommendation } from "./api/recommendations";
 
 // ── DESIGN TOKENS ─────────────────────────────────────────────
 const C = {
@@ -590,6 +591,77 @@ function StatsBar({ days }) {
   );
 }
 
+// ── RECOMMENDATIONS CARD ──────────────────────────────────────
+function RecommendationsCard() {
+  const [rec, setRec] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(()=>{
+    let cancelled = false;
+    (async ()=>{
+      try {
+        const data = await getRecommendation();
+        if (!cancelled) setRec(data);
+      } catch(e) {
+        if (e.status !== 404) console.error("Failed to load recommendation", e);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return ()=>{ cancelled = true; };
+  },[]);
+
+  const generate = async () => {
+    setGenerating(true);
+    setError("");
+    try {
+      const data = await generateRecommendation();
+      setRec(data);
+    } catch(e) {
+      console.error("Failed to generate recommendation", e);
+      setError(e.message || "Failed to generate recommendation.");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  return (
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px 16px"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+        marginBottom:12,paddingBottom:6,borderBottom:`1px solid ${C.border}`,flexWrap:"wrap",gap:8}}>
+        <div style={{fontSize:10,fontWeight:800,color:C.purple,textTransform:"uppercase",letterSpacing:"0.08em"}}>
+          Actionable Trading Recommendations
+        </div>
+        <button onClick={generate} disabled={generating} style={{
+          padding:"5px 12px",borderRadius:6,fontSize:11,fontWeight:600,
+          cursor:generating?"not-allowed":"pointer",
+          background:`${C.purple}22`,color:C.purple,border:`1px solid ${C.purple}55`,
+          opacity:generating?0.6:1,
+        }}>{generating?"Generating…":rec?"↻ Regenerate":"Generate Recommendation"}</button>
+      </div>
+
+      {loading ? (
+        <div style={{fontSize:12,color:C.muted}}>Loading…</div>
+      ) : error ? (
+        <div style={{fontSize:12,color:C.red}}>{error}</div>
+      ) : rec ? (
+        <div>
+          <div style={{fontSize:12,color:C.text,lineHeight:1.7,whiteSpace:"pre-wrap"}}>{rec.text}</div>
+          <div style={{fontSize:10,color:C.dim,marginTop:10}}>
+            Generated {new Date(rec.generatedAt).toLocaleString()} · based on {rec.daysAnalyzed} logged day{rec.daysAnalyzed!==1?"s":""}
+          </div>
+        </div>
+      ) : (
+        <div style={{fontSize:12,color:C.muted}}>
+          No recommendation generated yet — click "Generate Recommendation" to analyze your last 30 days.
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── SUMMARY TAB ───────────────────────────────────────────────
 function SummaryTab({ days }) {
   const allTrades = days.flatMap(d=>d.trades);
@@ -630,11 +702,7 @@ function SummaryTab({ days }) {
     .slice(-10)
     .reverse();
 
-  if (daysLogged.length===0) return (
-    <div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
-      No data in the last 30 days — log a day in the Calendar tab first.
-    </div>
-  );
+  const hasData = daysLogged.length>0;
 
   const Card = ({title, color, children}) => (
     <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px 16px"}}>
@@ -659,6 +727,13 @@ function SummaryTab({ days }) {
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {!hasData && (
+        <div style={{textAlign:"center",padding:"40px 20px",color:C.muted}}>
+          No data in the last 30 days — log a day in the Calendar tab first.
+        </div>
+      )}
+      {hasData && (
+      <>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
         <Card title="Signal Frequency" color={C.teal}>
           {topSigs.length===0
@@ -710,6 +785,10 @@ function SummaryTab({ days }) {
           ))}
         </Card>
       )}
+      </>
+      )}
+
+      <RecommendationsCard/>
     </div>
   );
 }
